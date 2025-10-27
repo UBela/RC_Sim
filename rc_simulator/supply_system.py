@@ -147,7 +147,31 @@ class HeatPumpAir(SupplySystemBase):
         system.electricity_out = 0
         return system
 
+class HeatPumpCustom(SupplySystemBase):
+    """
+    Custom Air-Water heat pump with user defined COP values for heating and cooling
+    """
 
+    def calc_loads(self):
+        system = SupplyOut()
+
+        if self.has_heating_demand:
+            x = self.t_out
+            system.cop = 0.0052 * x**2 + 0.244 * x + 3.3078 # Custom COP curve for heating
+            system.electricity_in = self.load / system.cop
+
+        elif self.has_cooling_demand:
+            x = self.t_out
+            system.cop = 0.0326 * x**2 - 2.5738 * x + 52.982 # Custom EER curve for cooling
+            system.electricity_in = self.load / system.cop
+
+        else:
+            raise ValueError(
+                'HeatPumpCustom called although there is no heating/cooling demand')
+
+        system.fossils_in = 0
+        system.electricity_out = 0
+        return system
 class HeatPumpWater(SupplySystemBase):
     """"
     BETA Version
