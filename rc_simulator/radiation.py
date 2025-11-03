@@ -22,7 +22,7 @@ __status__ = "production"
 class Location(object):
     """Set the Location of the Simulation with an Energy Plus Weather File"""
 
-    def __init__(self, epwfile_path):
+    def __init__(self, epwfile_path, resample_interval_minutes=None):
 
         # Set EPW Labels and import epw file
         epw_labels = ['year', 'month', 'day', 'hour', 'minute', 'datasource', 'drybulb_C', 'dewpoint_C', 'relhum_percent',
@@ -35,6 +35,12 @@ class Location(object):
         # Import EPW file
         self.weather_data = pd.read_csv(
             epwfile_path, skiprows=8, header=None, names=epw_labels).drop('datasource', axis=1)
+    
+            
+        
+        
+                                            
+                                            
 
     def calc_sun_position(self, latitude_deg, longitude_deg, year, hoy):
         """

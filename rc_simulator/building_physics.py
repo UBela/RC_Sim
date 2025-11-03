@@ -61,7 +61,7 @@ INPUT PARAMETER DEFINITION
         recovery []
     thermal_capacitance_per_floor_area: Thermal capacitance of the room per floor area [J/m2K]
     t_set_heating : Thermal heating set point [C]
-    t_set_cooling: Thermal cooling set point [C]
+    t_set_cooling: Thermal cooling set point [C] 
     max_cooling_energy_per_floor_area: Maximum cooling load. Set to -np.inf for unrestricted cooling [C]
     max_heating_energy_per_floor_area: Maximum heating load per floor area. Set to no.inf for unrestricted heating [C]
     heating_supply_system: The type of heating system. Choices are DirectHeater, ResistiveHeater, HeatPumpHeater.
@@ -115,6 +115,8 @@ class Zone(object):
                  cooling_supply_system=supply_system.HeatPumpAir,
                  heating_emission_system=emission_system.NewRadiators,
                  cooling_emission_system=emission_system.AirConditioning,
+                 set_temperature=22.0,
+                 hysterisis=0.25
                  ):
 
         # Zone Dimensions
@@ -177,6 +179,16 @@ class Zone(object):
         self.cooling_supply_system = cooling_supply_system
         self.heating_emission_system = heating_emission_system
         self.cooling_emission_system = cooling_emission_system
+        
+        # Control params
+        self.band = 0.5            # total width of comfort band [°C] (±0.25 default)
+        self.mode = "idle"         # "heat", "cool", or "idle"
+        self.Kp = 300.0            # proportional gain [W/K per m2] roughly
+        self.Ki = 50.0             # integral gain [W/K·h per m2]
+        self._ei = 0.0             # integral state
+        self.use_operative = False # set True if you prefer T_op
+        self.t_setpoint = set_temperature
+        self.hysteresis = hysterisis
 
     @property
     def h_tr_1(self):
@@ -234,6 +246,117 @@ class Zone(object):
             self.lighting_demand = self.lighting_load * self.floor_area
         else:
             self.lighting_demand = 0
+    
+    def solve_energy2(self, internal_gains, solar_gains, t_out, t_m_prev):
+        """
+        Hysteresis setpoint control with exact load solving.
+        - Uses a single setpoint `self.t_setpoint` and band `self.hysteresis` (°C).
+        - If T_air is within the band → no conditioning.
+        - If below/above band → solve by bisection for the load that lands exactly at the setpoint.
+        - Positive load = heating, negative load = cooling.
+        - Then runs your supply/emission systems exactly as before.
+        """
+
+        # ---- control: decide load ------------------------------------------------
+        # 1) Compute current temps with zero load to get today's state
+        self.calc_temperatures_crank_nicolson(0.0, internal_gains, solar_gains, t_out, t_m_prev)
+        T = self.t_air
+
+        # Expectation: you added these in __init__
+        # self.t_setpoint (°C), self.hysteresis (°C)
+        band_lo = self.t_setpoint - self.hysteresis / 2.0
+        band_hi = self.t_setpoint + self.hysteresis / 2.0
+
+        if band_lo <= T <= band_hi:
+            # inside band → idle
+            self.energy_demand = 0.0
+            self.has_heating_demand = False
+            self.has_cooling_demand = False
+            # Recompute temperatures with zero load (already done, but keep consistent)
+            self.calc_temperatures_crank_nicolson(0.0, internal_gains, solar_gains, t_out, t_m_prev)
+
+            # No system energy
+            self.heating_demand = 0.0
+            self.cooling_demand = 0.0
+            self.heating_sys_electricity = 0.0
+            self.heating_sys_fossils = 0.0
+            self.cooling_sys_electricity = 0.0
+            self.cooling_sys_fossils = 0.0
+            self.electricity_out = 0.0
+            self.cop = float('nan')
+
+        else:
+            # Outside band → solve exact load for center setpoint
+            if T < band_lo:
+                mode = "heat"
+                u_star = self._solve_load_for_setpoint(self.t_setpoint, 
+                                                        internal_gains=internal_gains,
+                                                        solar_gains=solar_gains,
+                                                        t_out=t_out,
+                                                        t_m_prev=t_m_prev,
+                                                        mode="heat")
+                self.energy_demand = min(u_star, self.max_heating_energy)
+                self.has_heating_demand = True
+                self.has_cooling_demand = False
+            else:
+                mode = "cool"
+                u_star = self._solve_load_for_setpoint(self.t_setpoint,
+                                                        internal_gains=internal_gains,
+                                                        solar_gains=solar_gains,
+                                                        t_out=t_out,
+                                                        t_m_prev=t_m_prev,
+                                                        mode="cool")
+                self.energy_demand = max(u_star, self.max_cooling_energy)
+                self.has_heating_demand = False
+                self.has_cooling_demand = True
+
+            self.calc_temperatures_crank_nicolson(self.energy_demand, internal_gains, solar_gains, t_out, t_m_prev)
+
+            supply_director = supply_system.SupplyDirector()
+
+            if self.has_heating_demand:
+                supply_director.set_builder(self.heating_supply_system(
+                    load=self.energy_demand,                
+                    t_out=t_out,
+                    heating_supply_temperature=self.heating_supply_temperature,
+                    cooling_supply_temperature=self.cooling_supply_temperature,
+                    has_heating_demand=True,
+                    has_cooling_demand=False
+                ))
+                supplyOut = supply_director.calc_system()
+                self.heating_demand = self.energy_demand
+                self.heating_sys_electricity = supplyOut.electricity_in
+                self.heating_sys_fossils = supplyOut.fossils_in
+                self.cooling_demand = 0.0
+                self.cooling_sys_electricity = 0.0
+                self.cooling_sys_fossils = 0.0
+                self.electricity_out = supplyOut.electricity_out
+                self.cop = supplyOut.cop
+
+            else:  
+                supply_director.set_builder(self.cooling_supply_system(
+                    load=(-self.energy_demand),                 
+                    t_out=t_out,
+                    heating_supply_temperature=self.heating_supply_temperature,
+                    cooling_supply_temperature=self.cooling_supply_temperature,
+                    has_heating_demand=False,
+                    has_cooling_demand=True
+                ))
+                supplyOut = supply_director.calc_system()
+                self.heating_demand = 0.0
+                self.heating_sys_electricity = 0.0
+                self.heating_sys_fossils = 0.0
+                self.cooling_demand = self.energy_demand      
+                self.cooling_sys_electricity = supplyOut.electricity_in
+                self.cooling_sys_fossils = supplyOut.fossils_in
+                self.electricity_out = supplyOut.electricity_out
+                self.cop = supplyOut.cop
+
+        self.sys_total_energy = (self.heating_sys_electricity + self.heating_sys_fossils +
+                                self.cooling_sys_electricity + self.cooling_sys_fossils)
+        self.heating_energy = self.heating_sys_electricity + self.heating_sys_fossils
+        self.cooling_energy = self.cooling_sys_electricity + self.cooling_sys_fossils
+
 
     def solve_energy(self, internal_gains, solar_gains, t_out, t_m_prev):
         """
@@ -380,6 +503,73 @@ class Zone(object):
             self.has_heating_demand = False
             self.has_cooling_demand = False
 
+    def _air_temp_given_load(self, u_W, internal_gains, solar_gains, t_out, t_m_prev):
+    # Returns T_air for a given zone load u_W (W). Positive = heating, negative = cooling.
+        return self.calc_temperatures_crank_nicolson(
+        u_W, internal_gains, solar_gains, t_out, t_m_prev)[1]
+
+    def _solve_load_for_setpoint(self, T_set, internal_gains, solar_gains, t_out, t_m_prev, mode):
+        """
+        Bisection to find u such that T_air(u) = T_set.
+        mode: "heat" or "cool"
+        Respects your max_*_energy bounds.
+        """
+        T0 = self._air_temp_given_load(0.0, internal_gains, solar_gains, t_out, t_m_prev)
+
+        # Finite bounds (in case user left inf)
+        maxH = float(self.max_heating_energy) if self.max_heating_energy != float("inf") else 1e9
+        maxC = float(self.max_cooling_energy) if self.max_cooling_energy != -float("inf") else -1e9
+
+        if mode == "heat":
+            if T0 >= T_set:
+                return 0.0
+            lo, hi = 0.0, maxH
+            # if even max heat can't reach setpoint, return max
+            if self._air_temp_given_load(hi, internal_gains, solar_gains, t_out, t_m_prev) < T_set:
+                return hi
+            f = lambda u: self._air_temp_given_load(u, internal_gains, solar_gains, t_out, t_m_prev) - T_set
+        else:  # "cool"
+            if T0 <= T_set:
+                return 0.0
+            lo, hi = maxC, 0.0   # note: maxC is negative
+            # if even max cooling can't reach setpoint, return maxC
+            if self._air_temp_given_load(lo, internal_gains, solar_gains, t_out, t_m_prev) > T_set:
+                return lo
+            f = lambda u: self._air_temp_given_load(u, internal_gains, solar_gains, t_out, t_m_prev) - T_set
+
+        # Bisection (fast; 20–25 iters is ample)
+        for _ in range(25):
+            mid = 0.5 * (lo + hi)
+            if f(mid) > 0:
+                # mid gives T_air above setpoint → for heating, reduce; for cooling, reduce too (bounds already carry sign)
+                hi = mid
+            else:
+                lo = mid
+            if abs(hi - lo) < 1.0:   # ~1 W precision
+                break
+        return 0.5 * (lo + hi)
+
+    def _select_mode(self, t_air, t_s):
+        T = 0.3 * t_air + 0.7 * t_s if self.use_operative else t_air
+        
+        low = self.t_set_heating - self.band / 2
+        high = self.t_set_cooling + self.band / 2
+        
+        if self.mode in ["idle", "heat"]:
+            if T < low:
+                self.mode = "heat"
+            elif T > low + self.band:
+                self.mode = "idle"
+        elif self.mode in ["idle", "cool"]:
+            if T > high:
+                self.mode = "cool"
+            elif T < high - self.band:
+                self.mode = "idle"
+        
+        self.has_cooling_demand = self.mode == "cool"
+        self.has_heating_demand = self.mode == "heat"
+            
+    
     def calc_temperatures_crank_nicolson(self, energy_demand, internal_gains, solar_gains, t_out, t_m_prev):
         """
         Determines node temperatures and computes derivation to determine the new node temperatures
